@@ -1,0 +1,152 @@
+bench7 - how to run it
+======================
+
+Machines (all in one private network):
+  app host      2 vCPU, runs the framework (1-VM setup: also Postgres)
+  db host       2-VM setup only: Postgres alone
+  generator 1   load generator + coordinator (has this repo)
+  generator 2.. extra load generators (plain Ubuntu, no repo needed)
+
+How many generators (8 vCPU each): 1-VM needs 2 (it tops out near 17k RPS). 2-VM needs 4: with 2
+the run stops on "generator CPU >= 90%" around 24k, with 4 it reaches ~30k.
+
+Placeholders used below:
+  <repo-url>     this repository
+  <app-ip>       private IP of the app host
+  <db-ip>        private IP of the DB host (2-VM setup)
+  <user>@<gen-N-ip>  login of extra generator N
+
+Every script takes --help and is safe to run again (finished steps are skipped).
+Secrets live in bench7.env (created on first use, never committed, never print it).
+
+
+0. Get the code  (app host, DB host, generator 1)
+-------------------------------------------------
+  git clone <repo-url> ~/bench7 && cd ~/bench7        # later: git pull
+
+
+1. Tune Linux  (every machine)
+------------------------------
+  ./tune_linux.sh                 # then log out and in again (open-file limit)
+
+
+2. Postgres  (the DB machine: app host for 1-VM, DB host for 2-VM)
+-------------------------------------------------------------------
+  ./setup_postgres.sh             # /data on the local NVMe (40 GB) + Postgres 18, started
+  ./setup_postgres.sh --data-gb 80    # DB-only host with room for the full 29 GB seed
+
+then ONE of:
+
+  2.1  1-VM (app on this same machine)
+  ./tune_postgres1.sh             # optional: --set name=value ... (e.g. --set commit_delay=0)
+
+  2.2  2-VM (Postgres alone here)
+  ./tune_postgres2.sh             # opens 5432 to 10.0.0.0/8 (--allow CIDR), starts the DB sampler :41902
+                                  # optional: --set name=value ...
+
+After a VM stop/start the local NVMe can come back blank: run ./setup_postgres.sh again,
+it re-creates the cluster and applies the last tune_postgres command; then seed again.
+
+
+3. Seed the database  (same machine as step 2)
+----------------------------------------------
+  ./seed_db.sh --size-gb 3        # ~3 GB, about 2 min on 2 vCPU
+  ./seed_db.sh                    # full data set, ~29 GB, about 33 min
+  ./seed_db.sh --reseed --size-gb 3   # drop and load again
+Runs detached (seed.log); Ctrl-C only stops the progress view, ./seed_db.sh follows it again.
+Compare results only between runs on the same seed size.
+Back to the seed after a test, no reload (seconds):  ./seed_db.sh   (on an already seeded DB)
+  deletes only the rows the test wrote, fixes the counters it bumped, vacuums, and checks every
+  table has exactly the seed's row count. Refuses while an app is connected: kill it first
+  (./kill_<framework>.sh) or add --force. ./run_<framework>.sh does the same delete on start.
+
+
+4. Toolchains + builds  (app host)
+----------------------------------
+  ./setup_toolchain.sh axum springboot      # or no argument = all 8 frameworks
+Frameworks: axum springboot aspnet gin fastapi node fastify_bun bun
+(./run_<framework>.sh also installs/builds on first use; this step just does it ahead of time.)
+
+
+5. Start a framework  (app host)
+--------------------------------
+  1-VM:  ./run_axum.sh
+  2-VM:  ./run_axum.sh --db-host <db-ip>     # asks once for the DB password:
+                                              # on the DB host: grep PG_PASSWORD bench7.env
+Options: --build (rebuild)  --no-clean (keep the last test's rows)  --profile 1vm|2vm
+         --set KEY=VALUE (app env, wins over the profile, e.g. --set BATCH_WINDOW_MS=200)
+Profiles (picked from where the DB is):
+  1vm  DB_POOL_TOTAL=12  BATCH_LANES=1  BATCH_MAX_ROWS=200   BATCH_WINDOW_MS=20
+  2vm  DB_POOL_TOTAL=24  BATCH_LANES=4  BATCH_MAX_ROWS=1000  BATCH_WINDOW_MS=20
+It prints the exact run_k6 command for step 7.
+
+Live view (app host, 2nd terminal):
+  ./watch_server.sh               # dashboard
+  ./watch_server.sh --log         # one line per second
+  ./watch_server.sh --port 41902  # on the DB host (2-VM)
+
+
+6. Connect the load generators  (generator 1, once)
+---------------------------------------------------
+An extra generator is a plain Ubuntu 24.04 VM (8 vCPU) in the same private network; it needs no
+repo and no public IP. Generator 1 must be able to ssh to it, either:
+  a) log in to generator 1 with "ssh -A" (your laptop key is forwarded for the first login), or
+  b) put generator 1's key on it: on generator 1 run ./connect_agent.sh once (creates
+     ~/.ssh/bench7_k6), then add ~/.ssh/bench7_k6.pub to the generator's ~/.ssh/authorized_keys
+     (or pass it as the VM's ssh key when you create the VM).
+Then, on generator 1:
+  ./connect_agent.sh                                              # k6 on generator 1 only
+  ./connect_agent.sh <user>@<gen-2-ip>                            # 2 generators (1-VM)
+  ./connect_agent.sh <user>@<gen-2-ip> <user>@<gen-3-ip> <user>@<gen-4-ip>   # 4 generators (2-VM)
+It installs k6 + network tuning on each, saves the list in k6-agents.env and prints "connected: ...".
+run_k6.sh then starts k6 on all of them (report header: "generators: local, gen-2, ...").
+Running it again with a new list replaces the old list; --agents '' on run_k6.sh runs generator 1 alone.
+
+
+7. Run the load test  (generator 1)
+-----------------------------------
+  1-VM:
+  ./run_k6.sh --ip <app-ip> --rps 1000,5000,21000,50000 --times 10,30,120,285 --warmup 30
+  2-VM:
+  ./run_k6.sh --ip <app-ip> --db-ip <db-ip> --rps 1000,5000,21000,50000 --times 10,30,120,285 --warmup 30
+
+  --payload-kb 5        write size (default 5 KB; --payload-kb 2 = the older ~2 KB runs)
+  --design normal       Group 2 routes (one INSERT per request, no cache) instead of batching
+  --name LABEL          results dir label
+  --p95 700 --p99 1000 --err 1 --drop 1 --window 5 | --no-stop      stop rules
+The command is the same for every framework (the app always listens on <app-ip>:8080).
+Report: results/<name>-<time>/report.md  (max RPS within SLO, stop reason, app + DB host metrics)
+
+
+8. Next framework  (app host)
+-----------------------------
+  ./kill_axum.sh                  # saves app log + host metrics to results/host/
+  ./run_springboot.sh             # then step 7 again
+
+All frameworks, one after the other (app host terminal / generator 1 terminal):
+  app host                                  generator 1
+  ./run_axum.sh        [--db-host <db-ip>]  ./run_k6.sh ... --name axum
+  ./kill_axum.sh
+  ./run_springboot.sh  [--db-host <db-ip>]  ./run_k6.sh ... --name springboot
+  ./kill_springboot.sh
+  ./run_aspnet.sh      [--db-host <db-ip>]  ./run_k6.sh ... --name aspnet
+  ./kill_aspnet.sh
+  ./run_gin.sh         [--db-host <db-ip>]  ./run_k6.sh ... --name gin
+  ./kill_gin.sh
+  ./run_fastapi.sh     [--db-host <db-ip>]  ./run_k6.sh ... --name fastapi
+  ./kill_fastapi.sh
+  ./run_node.sh        [--db-host <db-ip>]  ./run_k6.sh ... --name node
+  ./kill_node.sh
+  ./run_fastify_bun.sh [--db-host <db-ip>]  ./run_k6.sh ... --name fastify_bun
+  ./kill_fastify_bun.sh
+  ./run_bun.sh         [--db-host <db-ip>]  ./run_k6.sh ... --name bun
+  ./kill_bun.sh
+("..." = the step 7 arguments. Each run_ cleans the previous test's rows, so runs are comparable.)
+
+
+Undo everything on a machine
+----------------------------
+  sudo ./reset.sh                 # -y: no question, --all: also delete the checkout
+Extra generators have no repo: reset them from generator 1 BEFORE resetting generator 1 (the reset
+removes the bench7_k6 key that generator 1 logs in with):
+  ssh -i ~/.ssh/bench7_k6 <user>@<gen-N-ip> 'sudo bash -s -- -y' < reset.sh

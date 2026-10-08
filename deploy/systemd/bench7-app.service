@@ -1,0 +1,30 @@
+# bench7 app server (one framework at a time, directly on :8080, no proxy).
+# The framework and its runtime env come from /data/run/bench7-app.env, written by
+#   ./scripts/app.sh up <fw>      (writes env with BENCH7_FRAMEWORK=<fw>, restarts this unit, waits for /health)
+# Manual: ./scripts/app.sh env <fw> && sudo systemctl restart bench7-app
+# Same properties as the old transient unit: accounting on, NO cpu/memory limits.
+[Unit]
+Description=bench7 app server (framework from /data/run/bench7-app.env)
+Wants=network-online.target
+After=network-online.target postgresql@18-main.service
+RequiresMountsFor=/data
+AssertPathExists=/data/run/bench7-app.env
+
+[Service]
+Type=exec
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@ROOT@
+EnvironmentFile=/data/run/bench7-app.env
+ExecStart=@ROOT@/scripts/app.sh exec
+LimitNOFILE=1048576
+TasksMax=infinity
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+KillMode=control-group
+TimeoutStopSec=15
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+# Ensures /data exists on the ephemeral local NVMe, which comes back BLANK when the VM
+# is stopped and moved to another host. Formats only a disk with no partition table / filesystem.
+[Unit]
+Description=bench7 /data on local NVMe (re-create when blank)
+Before=postgresql@18-main.service bench7-app.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@ROOT@/scripts/prepare-data.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+{
+  "name": "bench7-bun",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "fast-jwt": "^6.3.3",
+    "lru-cache": "^11.5.3"
+  }
+}
